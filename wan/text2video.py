@@ -210,7 +210,18 @@ class WanT2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 # ---- keyframe-by-entropy ----
+                 keyframe_by_entropy: bool = False,
+                 keyframe_target_fps: float = 8.0,
+                 entropy_steps: int = 5,
+                 entropy_mode: str = "mean",  # "last" | "mean" | "ema"
+                 entropy_ema_alpha: float = 0.6,
+                 entropy_block_idx: int = -1,  # -1 = last block
+                 keyframe_cover: bool = True,
+                 debug_dir: str | None = None,
+                 save_debug_pt: bool = True,
+                 profile_timing: bool = False):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -258,6 +269,118 @@ class WanT2V:
                             (self.patch_size[1] * self.patch_size[2]) *
                             target_shape[1] / self.sp_size) * self.sp_size
 
+        # ===================== helpers for entropy keyframes =====================
+
+        def auto_keyframe_topk(frame_num_full: int,
+                               fps_full: float,
+                               fps_key: float,
+                               stride_t: int,
+                               min_k: int = 2,
+                               max_k: int | None = None) -> int:
+            """
+            根据目标关键帧 fps 自动估计 latent 关键帧数量 K。
+            frame_num_full: 像素帧数（例如 81）
+            fps_full: 模型采样 fps（A14B 通常是 config.sample_fps=16）
+            stride_t: vae 时间 stride（通常 4）
+            """
+            if fps_key <= 0:
+                raise ValueError(f"fps_key must be > 0, got {fps_key}")
+            if frame_num_full <= 1:
+                return max(min_k, 1)
+
+            # 目标像素关键帧数（近似，保持时长不变）
+            t_key = int(round(frame_num_full * (fps_key / float(fps_full))))
+            t_key = max(2, t_key)
+
+            # 对齐到 VAE 约束：像素帧数 = stride_t * n + 1（stride_t=4）
+            if stride_t > 1:
+                n = int(round((t_key - 1) / float(stride_t)))
+                t_key = n * stride_t + 1
+                t_key = max(stride_t + 1, t_key)  # 至少 2 个 latent -> 至少 4+1 像素帧
+
+            k = int(round((t_key - 1) / float(stride_t))) + 1
+            k = max(min_k, k)
+            if max_k is not None:
+                k = min(max_k, k)
+            return k
+
+        def select_keyframes(ent_1d: torch.Tensor,
+                             topk: int,
+                             cover: bool = True) -> torch.Tensor:
+            """
+            ent_1d: [F_latent]
+            return: sorted indices [K]
+            """
+            f = int(ent_1d.numel())
+            k = min(max(1, int(topk)), f)
+
+            # topk by entropy
+            vals, idx = torch.topk(ent_1d, k=k, largest=True, sorted=False)
+            _ = vals  # suppress unused warning
+            idx = idx.unique()
+
+            if cover and f >= 2:
+                idx = torch.cat([idx, idx.new_tensor([0, f - 1])]).unique()
+
+            # 如果超了 k：优先保留首尾，其余从高熵补
+            if idx.numel() > k:
+                keep_list = []
+                if cover and f >= 2:
+                    keep_list += [0, f - 1]
+                keep = torch.tensor(
+                    list(dict.fromkeys(keep_list)),
+                    device=idx.device,
+                    dtype=idx.dtype,
+                )
+                if keep.numel() < k:
+                    order = torch.argsort(ent_1d, descending=True)
+                    for j in order.tolist():
+                        if j in keep.tolist():
+                            continue
+                        keep = torch.cat([keep, keep.new_tensor([j])])
+                        if keep.numel() >= k:
+                            break
+                idx = keep[:k]
+
+            # 如果不足 k：用均匀 bucket 补齐
+            if idx.numel() < k and f > 1:
+                need = k - idx.numel()
+                if need > 0:
+                    extra = torch.linspace(
+                        0,
+                        f - 1,
+                        steps=need + 2,
+                        device=idx.device,
+                    )[1:-1].round().long()
+                    idx = torch.cat([idx, extra]).unique()
+                    if idx.numel() > k:
+                        idx = idx[:k]
+
+            return torch.sort(idx)[0]
+
+        def reset_multistep_state(scheduler):
+            # 复位 UniPC / DPM++ 的多步状态，确保裁剪后继续采样正常
+            if hasattr(scheduler, "config") and hasattr(
+                    scheduler.config, "solver_order"):
+                solver_order = int(scheduler.config.solver_order)
+            elif hasattr(scheduler, "model_outputs"):
+                solver_order = len(scheduler.model_outputs)
+            elif hasattr(scheduler, "timestep_list"):
+                solver_order = len(scheduler.timestep_list)
+            else:
+                solver_order = None
+
+            if hasattr(scheduler, "model_outputs") and solver_order is not None:
+                scheduler.model_outputs = [None] * solver_order
+            if hasattr(scheduler, "timestep_list") and solver_order is not None:
+                scheduler.timestep_list = [None] * solver_order
+            if hasattr(scheduler, "lower_order_nums"):
+                scheduler.lower_order_nums = 0
+            if hasattr(scheduler, "last_sample"):
+                scheduler.last_sample = None
+
+        # ========================================================================
+
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
@@ -286,6 +409,33 @@ class WanT2V:
                 device=self.device,
                 generator=seed_g)
         ]
+
+        from .utils.entropy_collector import EntropyCollector
+
+        # latent 总帧数（VAE latent time length）
+        latent_frames_full = int(target_shape[1])
+        fps_full = float(getattr(self.config, "sample_fps", 16))
+        stride_t = int(self.vae_stride[0])
+
+        keyframe_topk = auto_keyframe_topk(
+            frame_num_full=frame_num,
+            fps_full=fps_full,
+            fps_key=float(keyframe_target_fps),
+            stride_t=stride_t,
+            min_k=2,
+            max_k=latent_frames_full,
+        )
+
+        collector = EntropyCollector(
+            enabled=False,
+            mode=entropy_mode,
+            ema_alpha=entropy_ema_alpha,
+            block_idx=entropy_block_idx,
+        )
+        collector.reset()
+
+        seq_len_curr = seq_len  # may change after cropping
+        key_idx = None
 
         @contextmanager
         def noop_no_sync():
@@ -326,13 +476,14 @@ class WanT2V:
             else:
                 raise NotImplementedError("Unsupported solver.")
 
+            if entropy_steps > len(timesteps):
+                entropy_steps = len(timesteps)
+            if entropy_steps < 1:
+                entropy_steps = 1
+
             # sample videos
             latents = noise
-
-            arg_c = {'context': context, 'seq_len': seq_len}
-            arg_null = {'context': context_null, 'seq_len': seq_len}
-
-            for _, t in enumerate(tqdm(timesteps)):
+            for step_i, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
                 timestep = [t]
 
@@ -343,10 +494,23 @@ class WanT2V:
                 sample_guide_scale = guide_scale[1] if t.item(
                 ) >= boundary else guide_scale[0]
 
+                collect_entropy = bool(keyframe_by_entropy) and (
+                    step_i < entropy_steps)
+                collector.enabled = collect_entropy
+
                 noise_pred_cond = model(
-                    latent_model_input, t=timestep, **arg_c)[0]
+                    latent_model_input,
+                    t=timestep,
+                    context=context,
+                    seq_len=seq_len_curr,
+                    entropy_collector=collector if collect_entropy else None,
+                )[0]
                 noise_pred_uncond = model(
-                    latent_model_input, t=timestep, **arg_null)[0]
+                    latent_model_input,
+                    t=timestep,
+                    context=context_null,
+                    seq_len=seq_len_curr,
+                )[0]
 
                 noise_pred = noise_pred_uncond + sample_guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
@@ -358,6 +522,57 @@ class WanT2V:
                     return_dict=False,
                     generator=seed_g)[0]
                 latents = [temp_x0.squeeze(0)]
+
+                # -------- crop latent time dimension at the end of entropy window --------
+                if keyframe_by_entropy and (step_i == entropy_steps - 1):
+                    ent_final = collector.final()[0]  # [F_latent]
+                    key_idx = select_keyframes(
+                        ent_final,
+                        topk=keyframe_topk,
+                        cover=keyframe_cover,
+                    )
+
+                    # crop latent frames: [C, F_latent, H, W] -> keep only key frames
+                    latents = [
+                        latents[0][:, key_idx, :, :].contiguous(),
+                    ]
+
+                    # recompute seq_len for cropped latents
+                    # seq_len ≈ ceil( (H*W)/(patch_hw) * F_latent / sp_size ) * sp_size
+                    f_lat = int(latents[0].shape[1])
+                    seq_len_curr = math.ceil(
+                        (target_shape[2] * target_shape[3]) /
+                        (self.patch_size[1] * self.patch_size[2]) *
+                        f_lat / self.sp_size) * self.sp_size
+
+                    reset_multistep_state(sample_scheduler)
+
+                    # (optional) debug dump
+                    if debug_dir is not None and self.rank == 0:
+                        os.makedirs(debug_dir, exist_ok=True)
+                        if save_debug_pt:
+                            torch.save(
+                                {
+                                    "key_idx":
+                                    key_idx.detach().cpu(),
+                                    "entropy":
+                                    ent_final.detach().cpu(),
+                                    "keyframe_topk":
+                                    int(keyframe_topk),
+                                    "keyframe_target_fps":
+                                    float(keyframe_target_fps),
+                                    "fps_full":
+                                    float(fps_full),
+                                    "frame_num_full":
+                                    int(frame_num),
+                                    "latent_frames_full":
+                                    int(latent_frames_full),
+                                    "latent_frames_key":
+                                    int(f_lat),
+                                },
+                                os.path.join(debug_dir,
+                                             "entropy_keyframes.pt"),
+                            )
 
             x0 = latents
             if offload_model:

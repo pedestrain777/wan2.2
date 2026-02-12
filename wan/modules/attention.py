@@ -49,6 +49,25 @@ def flash_attention(
     deterministic:  bool. If True, slightly slower and uses more memory.
     dtype:          torch.dtype. Apply when dtype of q/k/v is not float16/bfloat16.
     """
+    # 当 FlashAttention-2/3 均不可用时，回退到普通 attention（基于 PyTorch SDPA），
+    # 以保证功能可用（只是性能会变慢）。
+    if not FLASH_ATTN_2_AVAILABLE and not FLASH_ATTN_3_AVAILABLE:
+        return attention(
+            q=q,
+            k=k,
+            v=v,
+            q_lens=q_lens,
+            k_lens=k_lens,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            q_scale=q_scale,
+            causal=causal,
+            window_size=window_size,
+            deterministic=deterministic,
+            dtype=dtype,
+            fa_version=None,
+        )
+
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
     assert q.device.type == 'cuda' and q.size(-1) <= 256
@@ -109,7 +128,23 @@ def flash_attention(
             causal=causal,
             deterministic=deterministic)[0].unflatten(0, (b, lq))
     else:
-        assert FLASH_ATTN_2_AVAILABLE
+        # 若 FlashAttention-2 仍不可用，进一步回退到普通 attention 实现，避免直接报错。
+        if not FLASH_ATTN_2_AVAILABLE:
+            return attention(
+                q=q.view(b, lq, -1, q.size(-1)),
+                k=k.view(b, lk, -1, k.size(-1)),
+                v=v.view(b, lk, -1, v.size(-1)),
+                q_lens=q_lens,
+                k_lens=k_lens,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                q_scale=q_scale,
+                causal=causal,
+                window_size=window_size,
+                deterministic=deterministic,
+                dtype=dtype,
+                fa_version=None,
+            )
         x = flash_attn.flash_attn_varlen_func(
             q=q,
             k=k,

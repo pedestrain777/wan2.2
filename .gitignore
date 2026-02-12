@@ -5,3 +5,57 @@ tmp_examples*
 new_checkpoint*
 batch_test*
 nohup*
+
+# --------------- 模型权重格式 ---------------
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.h5
+*.pb
+*.onnx
+*.safetensors
+
+# --------------- 存放模型的目录 ---------------
+models/
+checkpoints/
+weights/
+flolpips/weights/
+
+# --------------- 输出目录 ---------------
+output/
+results/
+logs/
+interpolation_outputs/
+*.log
+
+# --------------- 数据集目录 ---------------
+dataset/
+data/
+
+# --------------- 大型视频/数据文件 ---------------
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# --------------- Python环境/缓存 ---------------
+venv/
+conda_env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+
+# --------------- 其他 -------------
+*.tmp
+*.swp
+*.zip
+*.tar.gz
+*.tar
+.DS_Store
+.vscode/
+.idea/

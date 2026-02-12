@@ -123,7 +123,7 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(self, x, seq_lens, grid_sizes, freqs, entropy_collector=None):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -142,9 +142,25 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
+        q_r = rope_apply(q, grid_sizes, freqs)
+        k_r = rope_apply(k, grid_sizes, freqs)
+
+        # --- entropy hook (temporal) ---
+        if entropy_collector is not None and getattr(entropy_collector, "enabled",
+                                                     False):
+            from ..utils.attn_entropy import (
+                temporal_attn_entropy_from_qk,
+                token_entropy_to_frame,
+            )
+
+            ent_tok = temporal_attn_entropy_from_qk(
+                q_r, k_r, grid_sizes, seq_lens=seq_lens)
+            ent_frm = token_entropy_to_frame(ent_tok, grid_sizes, seq_lens)
+            entropy_collector.add(ent_frm, ent_tok, grid_sizes, seq_lens)
+
         x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
+            q=q_r,
+            k=k_r,
             v=v,
             k_lens=seq_lens,
             window_size=self.window_size)
@@ -225,6 +241,7 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        entropy_collector=None,
     ):
         r"""
         Args:
@@ -242,7 +259,11 @@ class WanAttentionBlock(nn.Module):
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
-            seq_lens, grid_sizes, freqs)
+            seq_lens,
+            grid_sizes,
+            freqs,
+            entropy_collector=entropy_collector,
+        )
         with torch.amp.autocast('cuda', dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
@@ -414,6 +435,7 @@ class WanModel(ModelMixin, ConfigMixin):
         context,
         seq_len,
         y=None,
+        entropy_collector=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -484,10 +506,22 @@ class WanModel(ModelMixin, ConfigMixin):
             grid_sizes=grid_sizes,
             freqs=self.freqs,
             context=context,
-            context_lens=context_lens)
+            context_lens=context_lens,
+        )
 
-        for block in self.blocks:
-            x = block(x, **kwargs)
+        block_idx = None
+        if entropy_collector is not None and getattr(entropy_collector, "enabled",
+                                                     False):
+            bi = getattr(entropy_collector, "block_idx", -1)
+            if bi is None:
+                bi = -1
+            num_layers = len(self.blocks)
+            block_idx = bi if bi >= 0 else (num_layers + bi)  # -1 -> last
+
+        for i, block in enumerate(self.blocks):
+            use_collector = entropy_collector if (
+                block_idx is not None and i == block_idx) else None
+            x = block(x, **kwargs, entropy_collector=use_collector)
 
         # head
         x = self.head(x, e)

@@ -171,7 +171,18 @@ class WanTI2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 # ---- keyframe-by-entropy ----
+                 keyframe_by_entropy: bool = False,
+                 keyframe_target_fps: float = 8.0,
+                 entropy_steps: int = 5,
+                 entropy_mode: str = "mean",
+                 entropy_ema_alpha: float = 0.6,
+                 entropy_block_idx: int = -1,
+                 keyframe_cover: bool = True,
+                 debug_dir: str | None = None,
+                 save_debug_pt: bool = True,
+                 profile_timing: bool = False):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -234,7 +245,18 @@ class WanTI2V:
             guide_scale=guide_scale,
             n_prompt=n_prompt,
             seed=seed,
-            offload_model=offload_model)
+            offload_model=offload_model,
+            keyframe_by_entropy=keyframe_by_entropy,
+            keyframe_target_fps=keyframe_target_fps,
+            entropy_steps=entropy_steps,
+            entropy_mode=entropy_mode,
+            entropy_ema_alpha=entropy_ema_alpha,
+            entropy_block_idx=entropy_block_idx,
+            keyframe_cover=keyframe_cover,
+            debug_dir=debug_dir,
+            save_debug_pt=save_debug_pt,
+            profile_timing=profile_timing,
+        )
 
     def t2v(self,
             input_prompt,
@@ -246,7 +268,18 @@ class WanTI2V:
             guide_scale=5.0,
             n_prompt="",
             seed=-1,
-            offload_model=True):
+            offload_model=True,
+            # ---- keyframe-by-entropy ----
+            keyframe_by_entropy: bool = False,
+            keyframe_target_fps: float = 8.0,
+            entropy_steps: int = 5,
+            entropy_mode: str = "mean",
+            entropy_ema_alpha: float = 0.6,
+            entropy_block_idx: int = -1,
+            keyframe_cover: bool = True,
+            debug_dir: str | None = None,
+            save_debug_pt: bool = True,
+            profile_timing: bool = False):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -290,6 +323,109 @@ class WanTI2V:
                             (self.patch_size[1] * self.patch_size[2]) *
                             target_shape[1] / self.sp_size) * self.sp_size
 
+        # ===================== helpers for entropy keyframes =====================
+
+        def auto_keyframe_topk(frame_num_full: int,
+                               fps_full: float,
+                               fps_key: float,
+                               stride_t: int,
+                               min_k: int = 2,
+                               max_k: int | None = None) -> int:
+            """
+            根据目标关键帧 fps 自动估计 latent 关键帧数量 K。
+            """
+            if fps_key <= 0:
+                raise ValueError(f"fps_key must be > 0, got {fps_key}")
+            if frame_num_full <= 1:
+                return max(min_k, 1)
+
+            t_key = int(round(frame_num_full * (fps_key / float(fps_full))))
+            t_key = max(2, t_key)
+
+            if stride_t > 1:
+                n = int(round((t_key - 1) / float(stride_t)))
+                t_key = n * stride_t + 1
+                t_key = max(stride_t + 1, t_key)
+
+            k = int(round((t_key - 1) / float(stride_t))) + 1
+            k = max(min_k, k)
+            if max_k is not None:
+                k = min(max_k, k)
+            return k
+
+        def select_keyframes(ent_1d: torch.Tensor,
+                             topk: int,
+                             cover: bool = True) -> torch.Tensor:
+            """
+            ent_1d: [F_latent]
+            return: sorted indices [K]
+            """
+            f = int(ent_1d.numel())
+            k = min(max(1, int(topk)), f)
+
+            vals, idx = torch.topk(ent_1d, k=k, largest=True, sorted=False)
+            _ = vals
+            idx = idx.unique()
+
+            if cover and f >= 2:
+                idx = torch.cat([idx, idx.new_tensor([0, f - 1])]).unique()
+
+            if idx.numel() > k:
+                keep_list = []
+                if cover and f >= 2:
+                    keep_list += [0, f - 1]
+                keep = torch.tensor(
+                    list(dict.fromkeys(keep_list)),
+                    device=idx.device,
+                    dtype=idx.dtype,
+                )
+                if keep.numel() < k:
+                    order = torch.argsort(ent_1d, descending=True)
+                    for j in order.tolist():
+                        if j in keep.tolist():
+                            continue
+                        keep = torch.cat([keep, keep.new_tensor([j])])
+                        if keep.numel() >= k:
+                            break
+                idx = keep[:k]
+
+            if idx.numel() < k and f > 1:
+                need = k - idx.numel()
+                if need > 0:
+                    extra = torch.linspace(
+                        0,
+                        f - 1,
+                        steps=need + 2,
+                        device=idx.device,
+                    )[1:-1].round().long()
+                    idx = torch.cat([idx, extra]).unique()
+                    if idx.numel() > k:
+                        idx = idx[:k]
+
+            return torch.sort(idx)[0]
+
+        def reset_multistep_state(scheduler):
+            if hasattr(scheduler, "config") and hasattr(
+                    scheduler.config, "solver_order"):
+                solver_order = int(scheduler.config.solver_order)
+            elif hasattr(scheduler, "model_outputs"):
+                solver_order = len(scheduler.model_outputs)
+            elif hasattr(scheduler, "timestep_list"):
+                solver_order = len(scheduler.timestep_list)
+            else:
+                solver_order = None
+
+            if hasattr(scheduler, "model_outputs") and solver_order is not None:
+                scheduler.model_outputs = [None] * solver_order
+            if hasattr(scheduler, "timestep_list") and solver_order is not None:
+                scheduler.timestep_list = [None] * solver_order
+            if hasattr(scheduler, "lower_order_nums"):
+                scheduler.lower_order_nums = 0
+            if hasattr(scheduler, "last_sample"):
+                scheduler.last_sample = None
+
+        # ========================================================================
+
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
@@ -318,6 +454,32 @@ class WanTI2V:
                 device=self.device,
                 generator=seed_g)
         ]
+
+        from .utils.entropy_collector import EntropyCollector
+
+        latent_frames_full = int(target_shape[1])
+        fps_full = float(getattr(self.config, "sample_fps", 24))
+        stride_t = int(self.vae_stride[0])
+
+        keyframe_topk = auto_keyframe_topk(
+            frame_num_full=frame_num,
+            fps_full=fps_full,
+            fps_key=float(keyframe_target_fps),
+            stride_t=stride_t,
+            min_k=2,
+            max_k=latent_frames_full,
+        )
+
+        collector = EntropyCollector(
+            enabled=False,
+            mode=entropy_mode,
+            ema_alpha=entropy_ema_alpha,
+            block_idx=entropy_block_idx,
+        )
+        collector.reset()
+
+        seq_len_curr = seq_len
+        key_idx = None
 
         @contextmanager
         def noop_no_sync():
@@ -357,14 +519,16 @@ class WanTI2V:
             latents = noise
             mask1, mask2 = masks_like(noise, zero=False)
 
-            arg_c = {'context': context, 'seq_len': seq_len}
-            arg_null = {'context': context_null, 'seq_len': seq_len}
+            if entropy_steps > len(timesteps):
+                entropy_steps = len(timesteps)
+            if entropy_steps < 1:
+                entropy_steps = 1
 
             if offload_model or self.init_on_cpu:
                 self.model.to(self.device)
                 torch.cuda.empty_cache()
 
-            for _, t in enumerate(tqdm(timesteps)):
+            for step_i, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
                 timestep = [t]
 
@@ -373,14 +537,27 @@ class WanTI2V:
                 temp_ts = (mask2[0][0][:, ::2, ::2] * timestep).flatten()
                 temp_ts = torch.cat([
                     temp_ts,
-                    temp_ts.new_ones(seq_len - temp_ts.size(0)) * timestep
+                    temp_ts.new_ones(seq_len_curr - temp_ts.size(0)) * timestep
                 ])
                 timestep = temp_ts.unsqueeze(0)
 
+                collect_entropy = bool(keyframe_by_entropy) and (
+                    step_i < entropy_steps)
+                collector.enabled = collect_entropy
+
                 noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0]
+                    latent_model_input,
+                    t=timestep,
+                    context=context,
+                    seq_len=seq_len_curr,
+                    entropy_collector=collector if collect_entropy else None,
+                )[0]
                 noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0]
+                    latent_model_input,
+                    t=timestep,
+                    context=context_null,
+                    seq_len=seq_len_curr,
+                )[0]
 
                 noise_pred = noise_pred_uncond + guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
@@ -392,6 +569,58 @@ class WanTI2V:
                     return_dict=False,
                     generator=seed_g)[0]
                 latents = [temp_x0.squeeze(0)]
+
+                # -------- crop latent + masks at the end of entropy window --------
+                if keyframe_by_entropy and (step_i == entropy_steps - 1):
+                    ent_final = collector.final()[0]  # [F_latent]
+                    key_idx = select_keyframes(
+                        ent_final,
+                        topk=keyframe_topk,
+                        cover=keyframe_cover,
+                    )
+
+                    # crop latents
+                    latents = [
+                        latents[0][:, key_idx, :, :].contiguous(),
+                    ]
+
+                    # crop masks
+                    mask1 = [mask1[0][:, key_idx, :, :].contiguous()]
+                    mask2 = [mask2[0][:, key_idx, :, :].contiguous()]
+
+                    f_lat = int(latents[0].shape[1])
+                    seq_len_curr = math.ceil(
+                        (target_shape[2] * target_shape[3]) /
+                        (self.patch_size[1] * self.patch_size[2]) *
+                        f_lat / self.sp_size) * self.sp_size
+
+                    reset_multistep_state(sample_scheduler)
+
+                    if debug_dir is not None and self.rank == 0:
+                        os.makedirs(debug_dir, exist_ok=True)
+                        if save_debug_pt:
+                            torch.save(
+                                {
+                                    "key_idx":
+                                    key_idx.detach().cpu(),
+                                    "entropy":
+                                    ent_final.detach().cpu(),
+                                    "keyframe_topk":
+                                    int(keyframe_topk),
+                                    "keyframe_target_fps":
+                                    float(keyframe_target_fps),
+                                    "fps_full":
+                                    float(fps_full),
+                                    "frame_num_full":
+                                    int(frame_num),
+                                    "latent_frames_full":
+                                    int(latent_frames_full),
+                                    "latent_frames_key":
+                                    int(f_lat),
+                                },
+                                os.path.join(debug_dir,
+                                             "entropy_keyframes.pt"),
+                            )
             x0 = latents
             if offload_model:
                 self.model.cpu()
