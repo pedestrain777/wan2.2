@@ -222,6 +222,23 @@ def _parse_args():
         default=False,
         help="Whether to convert model paramerters dtype.")
 
+    # keyframe-by-entropy (t2v / ti2v)
+    parser.add_argument(
+        "--keyframe_by_entropy",
+        type=str2bool,
+        default=False,
+        help="Whether to use entropy-based keyframe selection for efficient sampling.")
+    parser.add_argument(
+        "--keyframe_target_fps",
+        type=float,
+        default=8.0,
+        help="Target FPS for keyframe count when keyframe_by_entropy is True.")
+    parser.add_argument(
+        "--entropy_steps",
+        type=int,
+        default=5,
+        help="Number of sampling steps to collect entropy when keyframe_by_entropy is True.")
+
     # animate
     parser.add_argument(
         "--src_root_path",
@@ -424,7 +441,11 @@ def generate(args):
             sampling_steps=args.sample_steps,
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
-            offload_model=args.offload_model)
+            offload_model=args.offload_model,
+            keyframe_by_entropy=getattr(args, "keyframe_by_entropy", False),
+            keyframe_target_fps=getattr(args, "keyframe_target_fps", 8.0),
+            entropy_steps=getattr(args, "entropy_steps", 5),
+        )
     elif "ti2v" in args.task:
         logging.info("Creating WanTI2V pipeline.")
         wan_ti2v = wan.WanTI2V(
