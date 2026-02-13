@@ -568,11 +568,18 @@ def generate(args):
             suffix = '.mp4'
             args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{formatted_prompt}_{formatted_time}" + suffix
 
-        logging.info(f"Saving generated video to {args.save_file}")
+        # 选输出 fps：若启用 entropy keyframes，则用目标 keyframe fps；否则用原 cfg.sample_fps
+        out_fps = cfg.sample_fps
+        if getattr(args, "keyframe_by_entropy", False) and ("t2v" in args.task):
+            out_fps = float(getattr(args, "keyframe_target_fps", cfg.sample_fps))
+
+        logging.info(
+            f"Saving generated video to {args.save_file} (fps={out_fps}, frames={video.shape[1]})"
+        )
         save_video(
             tensor=video[None],
             save_file=args.save_file,
-            fps=cfg.sample_fps,
+            fps=out_fps,
             nrow=1,
             normalize=True,
             value_range=(-1, 1))
